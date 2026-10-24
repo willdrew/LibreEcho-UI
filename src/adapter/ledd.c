@@ -234,12 +234,14 @@ struct daemon_context {
     int pattern_kind;
     struct colour pattern_colour;
     unsigned int pattern_repeats;
+    double pattern_period;
     double pattern_started;
     int mute_pattern_active;
     struct colour mute_pattern_colour;
     int pattern_previous_kind;
     struct colour pattern_previous_colour;
     unsigned int pattern_previous_repeats;
+    double pattern_previous_period;
     char pattern_owner[32];
     char pattern_previous_owner[32];
     struct colour pattern_saved;
@@ -320,8 +322,11 @@ struct daemon_context {
 /* PATTERN_SOLID holds a steady colour until its owner stops it. The mute
    indicator needs a state you can read at a glance, which neither the pulse
    nor the 1.5s meter can express. */
+/* PATTERN_CHASE spins a comet with a fading tail round the ring;
+   PATTERN_SCANNER sweeps a bar side to side across the front with a trail
+   (Knight Rider). Both count repeats in laps; 0 runs until stopped. */
 enum pattern_kind { PATTERN_NONE = 0, PATTERN_PULSE, PATTERN_FLASH,
-                    PATTERN_SOLID };
+                    PATTERN_SOLID, PATTERN_CHASE, PATTERN_SCANNER };
 enum visualizer_mood {
     VISUALIZER_MOOD_CALM = 0,
     VISUALIZER_MOOD_BALANCED,
@@ -2609,7 +2614,9 @@ static const char *pattern_name(int kind)
 {
     return kind == PATTERN_PULSE ? "pulse" :
            kind == PATTERN_FLASH ? "flash" :
-           kind == PATTERN_SOLID ? "solid" : "none";
+           kind == PATTERN_SOLID ? "solid" :
+           kind == PATTERN_CHASE ? "chase" :
+           kind == PATTERN_SCANNER ? "scanner" : "none";
 }
 
 static void copy_pattern_owner(char *destination, const char *source)
@@ -2647,6 +2654,7 @@ static void stop_pattern(struct daemon_context *ctx, const char *owner,
             ctx->pattern_kind = ctx->pattern_previous_kind;
             ctx->pattern_colour = ctx->pattern_previous_colour;
             ctx->pattern_repeats = ctx->pattern_previous_repeats;
+            ctx->pattern_period = ctx->pattern_previous_period;
             copy_pattern_owner(ctx->pattern_owner,
                                ctx->pattern_previous_owner);
             ctx->pattern_previous_kind = PATTERN_NONE;
@@ -2677,7 +2685,7 @@ static void stop_pattern(struct daemon_context *ctx, const char *owner,
 
 static void start_pattern(struct daemon_context *ctx, int kind,
                           const struct colour *colour, unsigned int repeats,
-                          const char *owner, double now)
+                          double period, const char *owner, double now)
 {
     /* Mute is a persistent underlay, not another transient stack entry.
        Heartbeats update it without interrupting an action or pairing cue. */
@@ -2695,6 +2703,7 @@ static void start_pattern(struct daemon_context *ctx, int kind,
             ctx->pattern_previous_kind = ctx->pattern_kind;
             ctx->pattern_previous_colour = ctx->pattern_colour;
             ctx->pattern_previous_repeats = ctx->pattern_repeats;
+            ctx->pattern_previous_period = ctx->pattern_period;
             copy_pattern_owner(ctx->pattern_previous_owner, ctx->pattern_owner);
         }
     } else {
@@ -2707,6 +2716,7 @@ static void start_pattern(struct daemon_context *ctx, int kind,
     ctx->pattern_kind = kind;
     ctx->pattern_colour = *colour;
     ctx->pattern_repeats = repeats;
+    ctx->pattern_period = period;
     copy_pattern_owner(ctx->pattern_owner, owner);
     ctx->pattern_started = now;
     ctx->animation_active = 0;
@@ -2714,6 +2724,96 @@ static void start_pattern(struct daemon_context *ctx, int kind,
        immediately rather than letting it replay later. */
     if (ctx->music_active)
         le_music_director_interrupt(&ctx->music_director);
+}
+
+static void update_pattern(struct daemon_context *ctx, double now);
+
+/* A pattern with a repeat count is done: go back to the pattern it
+   interrupted, or to the base ring. */
+static void finish_pattern(struct daemon_context *ctx, double now)
+{
+    if (ctx->pattern_previous_kind != PATTERN_NONE) {
+        ctx->pattern_kind = ctx->pattern_previous_kind;
+        ctx->pattern_colour = ctx->pattern_previous_colour;
+        ctx->pattern_repeats = ctx->pattern_previous_repeats;
+        ctx->pattern_period = ctx->pattern_previous_period;
+        copy_pattern_owner(ctx->pattern_owner,
+                           ctx->pattern_previous_owner);
+        ctx->pattern_previous_kind = PATTERN_NONE;
+        ctx->pattern_previous_owner[0] = '\0';
+        ctx->pattern_started = now;
+        update_pattern(ctx, now);
+    } else {
+        char finished_owner[32];
+        copy_pattern_owner(finished_owner, ctx->pattern_owner);
+        stop_pattern(ctx, finished_owner, now);
+    }
+}
+
+/* Lateral position (-1 left .. 1 right, seen from the front) of a pixel:
+   the front centre lies between IDLE_INDICATOR_PIXEL_A and _B. */
+static double pixel_lateral(size_t i)
+{
+    const double pi = 3.14159265358979323846;
+    double centre = ((double)IDLE_INDICATOR_PIXEL_A +
+                     (double)IDLE_INDICATOR_PIXEL_B) / 2.0;
+
+    return sine_approx(2.0 * pi * ((double)i - centre) / (double)RING_PIXELS);
+}
+
+/* Chase: a comet round the ring, head one pixel, tail CHASE_TAIL_PIXELS.
+   Scanner: a bar sweeps left to right and back once per period; each pixel
+   takes the brightest of the last few head positions, fading with age, so
+   the bar leaves a trail like KITT's. */
+#define CHASE_TAIL_PIXELS 5.0
+#define SCANNER_WIDTH 0.45
+#define SCANNER_TRAIL_STEPS 8
+#define SCANNER_TRAIL_STEP_S 0.045
+#define SCANNER_TRAIL_DECAY 0.62
+static void moving_pattern_frame(int kind, double elapsed, double period,
+                                 const struct colour *c,
+                                 struct pixel pixels[RING_PIXELS])
+{
+    const double pi = 3.14159265358979323846;
+    size_t i;
+
+    for (i = 0; i < RING_PIXELS; i++) {
+        double level = 0.0;
+
+        if (kind == PATTERN_CHASE) {
+            double turns = elapsed / period;
+            double behind;
+
+            turns -= (double)(unsigned long)turns;
+            behind = turns * (double)RING_PIXELS - (double)i;
+            while (behind >= (double)RING_PIXELS / 2.0)
+                behind -= (double)RING_PIXELS;
+            while (behind < -(double)RING_PIXELS / 2.0)
+                behind += (double)RING_PIXELS;
+            level = behind < 0.0 ? startup_soft_edge(-behind)
+                                 : startup_soft_edge(behind / CHASE_TAIL_PIXELS);
+        } else {
+            double x = pixel_lateral(i), weight = 1.0;
+            int k;
+
+            for (k = 0; k < SCANNER_TRAIL_STEPS; k++) {
+                double t = elapsed - (double)k * SCANNER_TRAIL_STEP_S;
+                double head, here;
+
+                if (t < 0.0)
+                    break;
+                head = -sine_approx(2.0 * pi * t / period + pi / 2.0);
+                here = weight * startup_soft_edge((x > head ? x - head : head - x) /
+                                                  SCANNER_WIDTH);
+                if (here > level)
+                    level = here;
+                weight *= SCANNER_TRAIL_DECAY;
+            }
+        }
+        pixels[i] = (struct pixel){(unsigned int)(c->r * level + 0.5),
+                                   (unsigned int)(c->g * level + 0.5),
+                                   (unsigned int)(c->b * level + 0.5)};
+    }
 }
 
 static void update_pattern(struct daemon_context *ctx, double now)
@@ -2734,24 +2834,24 @@ static void update_pattern(struct daemon_context *ctx, double now)
         unsigned int cycle = (unsigned int)(elapsed / 0.20);
         on = (cycle % 2U) == 0;
         if (ctx->pattern_repeats && cycle >= ctx->pattern_repeats * 2U) {
-            if (ctx->pattern_previous_kind != PATTERN_NONE) {
-                ctx->pattern_kind = ctx->pattern_previous_kind;
-                ctx->pattern_colour = ctx->pattern_previous_colour;
-                ctx->pattern_repeats = ctx->pattern_previous_repeats;
-                copy_pattern_owner(ctx->pattern_owner,
-                                   ctx->pattern_previous_owner);
-                ctx->pattern_previous_kind = PATTERN_NONE;
-                ctx->pattern_previous_owner[0] = '\0';
-                ctx->pattern_started = now;
-                update_pattern(ctx, now);
-            } else {
-                char finished_owner[32];
-                copy_pattern_owner(finished_owner, ctx->pattern_owner);
-                stop_pattern(ctx, finished_owner, now);
-            }
+            finish_pattern(ctx, now);
             return;
         }
         if (!on) output.brightness = 0;
+    } else if (ctx->pattern_kind == PATTERN_CHASE ||
+               ctx->pattern_kind == PATTERN_SCANNER) {
+        struct pixel pixels[RING_PIXELS];
+        struct colour capped = night_capped(ctx, output);
+
+        if (ctx->pattern_repeats &&
+            elapsed >= ctx->pattern_period * (double)ctx->pattern_repeats) {
+            finish_pattern(ctx, now);
+            return;
+        }
+        moving_pattern_frame(ctx->pattern_kind, elapsed, ctx->pattern_period,
+                             &output, pixels);
+        output_pixels(ctx, pixels, capped.brightness);
+        return;
     }
     hardware_apply(ctx, &output);
 }
@@ -3324,11 +3424,38 @@ static int handle_request(struct daemon_context *ctx, int fd,
             colour.g = g;
             colour.b = b;
             colour.brightness = brightness;
-            start_pattern(ctx, kind, &colour, repeats, owner, now);
+            start_pattern(ctx, kind, &colour, repeats, 0.0, owner, now);
             update_pattern(ctx, now);
             return send_response(fd, request.id, 1, "{\"pattern_active\":true}", NULL);
         }
-        if (!strcmp(pattern, "half_ring") || !strcmp(pattern, "chase") ||
+        if (!strcmp(pattern, "chase") || !strcmp(pattern, "scanner")) {
+            int kind = !strcmp(pattern, "chase") ? PATTERN_CHASE : PATTERN_SCANNER;
+            unsigned int period_ms = kind == PATTERN_CHASE ? 1200U : 1600U;
+            struct json_span period_value;
+
+            if (get_arg_unsigned(&request, "r", &r, 255) != 0 ||
+                get_arg_unsigned(&request, "g", &g, 255) != 0 ||
+                get_arg_unsigned(&request, "b", &b, 255) != 0 ||
+                get_arg_unsigned(&request, "brightness", &brightness, 100) != 0 ||
+                get_arg_unsigned(&request, "repeats", &repeats, 100) != 0)
+                return send_response(fd, request.id, 0, NULL,
+                                     "pattern requires r, g, b, brightness and repeats");
+            /* Optional: one lap (chase) or one left-right-left sweep. */
+            if (json_object_find(request.args, "period_ms", &period_value) == 1 &&
+                (get_arg_unsigned(&request, "period_ms", &period_ms, 10000) != 0 ||
+                 period_ms < 200U))
+                return send_response(fd, request.id, 0, NULL,
+                                     "period_ms must be 200..10000");
+            colour.r = r;
+            colour.g = g;
+            colour.b = b;
+            colour.brightness = brightness;
+            start_pattern(ctx, kind, &colour, repeats, period_ms / 1000.0,
+                          owner, now);
+            update_pattern(ctx, now);
+            return send_response(fd, request.id, 1, "{\"pattern_active\":true}", NULL);
+        }
+        if (!strcmp(pattern, "half_ring") ||
             !strcmp(pattern, "dance") || !strcmp(pattern, "random"))
             return send_response(fd, request.id, 0, NULL,
                                  "pattern is reserved until per-pixel LED hardware is available");
