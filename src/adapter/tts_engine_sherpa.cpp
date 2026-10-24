@@ -14,6 +14,7 @@
  */
 #include "tts_engine.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -427,6 +428,93 @@ struct tts_engine *tts_engine_init(const char *model_dir, const char *voice)
     return engine;
 }
 
+/*
+ * Speech loudness. The VITS voices come out at about -19..-24 dBFS of active
+ * speech with peaks near -3 dBFS, well under the radio (-12..-14), so answers
+ * sound quiet next to music at the same volume. With a target set, the
+ * speech is brought to that active level (gain capped at 14 dB) and peaks are
+ * rounded off by a tanh soft limiter above 0.6 instead of clipping.
+ *
+ * The target is LE_TTS_LOUDNESS_DB or the first line of
+ * /data/libreecho/config/tts-loudness ("-14"; "off" or no file leaves the
+ * audio as it was). Read on every utterance so a change needs no restart.
+ */
+#define TTS_LOUDNESS_FILE "/data/libreecho/config/tts-loudness"
+#define TTS_LOUDNESS_MAX_GAIN_DB 14.0
+#define TTS_LOUDNESS_KNEE 0.6f
+#define TTS_LOUDNESS_GATE_DB -40.0
+
+static bool loudness_target(double *target_db)
+{
+    char line[32] = "";
+    const char *value = getenv("LE_TTS_LOUDNESS_DB");
+    char *end;
+    double parsed;
+
+    if (!value || !value[0]) {
+        FILE *f = fopen(TTS_LOUDNESS_FILE, "r");
+
+        if (!f)
+            return false;
+        if (!fgets(line, sizeof(line), f))
+            line[0] = '\0';
+        fclose(f);
+        value = line;
+    }
+    parsed = strtod(value, &end);
+    while (*end == ' ' || *end == '\n' || *end == '\r' || *end == '\t')
+        ++end;
+    if (end == value || *end || parsed < -30.0 || parsed > -6.0)
+        return false;
+    *target_db = parsed;
+    return true;
+}
+
+/* Power mean of the 30 ms frames above the gate, in dBFS (or -100). */
+static double active_level_db(const float *x, size_t n, int rate)
+{
+    size_t frame = rate > 0 ? (size_t)rate * 3 / 100 : 480;
+    double sum = 0.0;
+    size_t active = 0;
+
+    for (size_t at = 0; frame && at + frame <= n; at += frame) {
+        double power = 0.0;
+
+        for (size_t i = 0; i < frame; ++i)
+            power += (double)x[at + i] * x[at + i];
+        power /= (double)frame;
+        if (10.0 * log10(power + 1e-18) > TTS_LOUDNESS_GATE_DB) {
+            sum += power;
+            ++active;
+        }
+    }
+    return active ? 10.0 * log10(sum / (double)active) : -100.0;
+}
+
+static void apply_loudness(float *x, size_t n, int rate)
+{
+    double target, level, gain_db;
+    float gain;
+
+    if (!loudness_target(&target))
+        return;
+    level = active_level_db(x, n, rate);
+    if (level <= -100.0)
+        return;
+    gain_db = target - level;
+    if (gain_db > TTS_LOUDNESS_MAX_GAIN_DB)
+        gain_db = TTS_LOUDNESS_MAX_GAIN_DB;
+    gain = (float)pow(10.0, gain_db / 20.0);
+    for (size_t i = 0; i < n; ++i) {
+        float v = x[i] * gain, a = fabsf(v);
+
+        if (a > TTS_LOUDNESS_KNEE)
+            v = copysignf(TTS_LOUDNESS_KNEE + (1.0f - TTS_LOUDNESS_KNEE) *
+                          tanhf((a - TTS_LOUDNESS_KNEE) / (1.0f - TTS_LOUDNESS_KNEE)), v);
+        x[i] = v;
+    }
+}
+
 int tts_engine_sample_rate(const struct tts_engine *engine)
 {
     return engine ? engine->sample_rate : 22050;
@@ -542,8 +630,11 @@ int tts_engine_synthesize(struct tts_engine *engine, const char *text,
         return -1;
     }
 
-    /* Convert float32 [-1,1] → S16_LE. */
+    /* Convert float32 [-1,1] → S16_LE, after the loudness step (on a copy:
+       the generated buffer belongs to sherpa-onnx). */
     size_t n = static_cast<size_t>(audio->n);
+    std::vector<float> level(audio->samples, audio->samples + n);
+    apply_loudness(level.data(), n, engine->sample_rate);
     short *samples = static_cast<short *>(malloc(n * sizeof(short)));
     if (!samples) {
         SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
@@ -551,7 +642,7 @@ int tts_engine_synthesize(struct tts_engine *engine, const char *text,
     }
 
     for (size_t i = 0; i < n; ++i) {
-        float v = audio->samples[i];
+        float v = level[i];
         if (v > 1.0f)  v = 1.0f;
         if (v < -1.0f) v = -1.0f;
         samples[i] = static_cast<short>(v * 32767.0f);
