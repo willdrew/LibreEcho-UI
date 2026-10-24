@@ -23,7 +23,14 @@
 #endif
 
 #define MIC_CARD 0
-#define MIC_DEVICE 24
+#ifdef LE_TARGET_ROOK
+/* Echo Spot: TLV320AIC3101 Capture, six lanes (four microphones, loopback). */
+#define MIC_DEVICE_ARG "22"
+#define MIC_RAW_ARG "6"
+#else
+#define MIC_DEVICE_ARG "24"
+#define MIC_RAW_ARG "9"
+#endif
 #define MIC_RATE LE_VOICE_RATE
 #define MIC_RAW_CHANNELS LE_VOICE_RAW_CHANNELS
 #define MIC_CAPTURE_CHANNELS LE_VOICE_LOGICAL_CHANNELS
@@ -72,6 +79,7 @@ static long long monotonic_ms(void)
     return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+#ifndef LE_TARGET_ROOK
 static void beam_view_publish(const struct le_beamformer *bf)
 {
     unsigned int b;
@@ -95,6 +103,7 @@ static void beam_view_publish(const struct le_beamformer *bf)
     __sync_synchronize();
     beam_view->seq++;
 }
+#endif
 
 static void beam_view_stop(void)
 {
@@ -263,7 +272,7 @@ static int read_miccal_file(const char *path, int *value)
     return 1;
 }
 
-static int read_miccal_list(const char *path, int values[7])
+static int read_miccal_list(const char *path, int values[MIC_LOGICAL_CHANNELS])
 {
     FILE *file;
     int count = 0;
@@ -286,7 +295,7 @@ static int read_miccal_list(const char *path, int values[7])
 }
 
 static int read_miccal(const char *idme_dir, const char *dt_idme_dir,
-                       int values[7])
+                       int values[MIC_LOGICAL_CHANNELS])
 {
     char path[256];
     int count = 0;
@@ -586,10 +595,17 @@ static int configure_capture_path(const struct micd_config *config)
 {
     char micpga[8];
     char default_micpga[8];
-    struct mixer_setting micpga_settings[4];
-    static const char *const micpga_controls[4] = {
+#ifdef LE_TARGET_ROOK
+#define MIC_ADC_COUNT 2
+#else
+#define MIC_ADC_COUNT 4
+#endif
+    struct mixer_setting micpga_settings[MIC_ADC_COUNT];
+    static const char *const micpga_controls[MIC_ADC_COUNT] = {
         "ADC_A MICPGA Volume Ctrl", "ADC_B MICPGA Volume Ctrl",
+#ifndef LE_TARGET_ROOK
         "ADC_C MICPGA Volume Ctrl", "ADC_D MICPGA Volume Ctrl"
+#endif
     };
     static const struct mixer_setting settings[] = {
         {"Mic PGA Switch", "1", "1"},
@@ -599,6 +615,8 @@ static int configure_capture_path(const struct micd_config *config)
         {"ADC_A Right Ip Select ADC_A DIF1_R switch", "1", NULL},
         {"ADC_B Left Ip Select ADC_B DIF1_L switch", "1", NULL},
         {"ADC_B Right Ip Select ADC_B DIF1_R switch", "1", NULL},
+#ifndef LE_TARGET_ROOK
+        /* The Spot has two ADCs and keeps its stock DIF1 input gain. */
         {"ADC_C Left Ip Select ADC_C DIF1_L switch", "1", NULL},
         {"ADC_C Right Ip Select ADC_C DIF1_R switch", "1", NULL},
         {"ADC_D Left Ip Select ADC_D DIF1_L switch", "1", NULL},
@@ -611,6 +629,7 @@ static int configure_capture_path(const struct micd_config *config)
         {"ADC_C DIF1_R Input Gain", "1", NULL},
         {"ADC_D DIF1_L Input Gain", "1", NULL},
         {"ADC_D DIF1_R Input Gain", "1", NULL},
+#endif
         {"SpiTimeStamps", "0", NULL}
     };
     size_t i;
@@ -626,7 +645,7 @@ static int configure_capture_path(const struct micd_config *config)
                    micpga_volume_from_environment());
     (void)snprintf(default_micpga, sizeof(default_micpga), "%d",
                    MICPGA_DEFAULT_VOLUME);
-    for (i = 0; i < 4; ++i) {
+    for (i = 0; i < MIC_ADC_COUNT; ++i) {
         micpga_settings[i].control = micpga_controls[i];
         micpga_settings[i].value = micpga;
         micpga_settings[i].value2 = micpga;
@@ -668,6 +687,43 @@ static int format_status(char *buffer, size_t size,
     int n;
 
     format_mic_list(beam_mic_mask(), mics, sizeof(mics));
+#ifdef LE_TARGET_ROOK
+    n = snprintf(
+        buffer, size,
+        "{\"available\":%s,\"simulated\":false,"
+        "\"sources\":[{\"id\":\"0:22\",\"card\":0,\"device\":22,"
+        "\"name\":\"Amazon Echo Spot microphones\","
+        "\"rate\":16000,\"channels\":6,\"bits\":24,\"valid_bits\":16,"
+        "\"encoding\":\"pcm_s24_3le\","
+        "\"microphones\":["
+        "{\"channel\":0,\"name\":\"Microphone 1\"},"
+        "{\"channel\":1,\"name\":\"Microphone 2\"},"
+        "{\"channel\":2,\"name\":\"Microphone 3\"},"
+        "{\"channel\":3,\"name\":\"Microphone 4\"}]}],"
+        "\"raw_channels\":6,\"active_microphone_channels\":4,"
+        "\"inactive_transport_channels\":[4,5],\"logical_channels\":4,"
+        "\"capture\":{\"active\":%s,\"owner\":%s},"
+        "\"hardware_profile\":{\"name\":\"rook-tlv320aic3101-fpga-6ch\","
+        "\"configured\":%s,\"adc_codecs\":2},"
+        "\"calibration\":{\"q14\":[%d,%d,%d,%d],"
+        "\"fallback\":16384,\"source\":\"%s\","
+        "\"values_found\":%d,\"complete\":%s,"
+        "\"selected_logical_mics\":[%s],"
+        "\"applied_to_raw_stream\":false,"
+        "\"applied_to_calibrated_stream\":true,"
+        "\"mapping_available\":true,"
+        "\"mapping\":\"lanes 0-3 microphones, 4-5 playback loopback\"},"
+        "\"pipeline\":{\"stage\":\"mic-average\","
+        "\"highpass_hz\":80,\"vad\":\"native-energy-baseline\","
+        "\"aec\":false,\"beamforming\":false,\"wake_word\":false}}",
+        available ? "true" : "false",
+        capture_active ? "true" : "false",
+        capture_active ? "\"raw-stream\"" : "null",
+        capture_configured ? "true" : "false",
+        values[0], values[1], values[2], values[3],
+        miccal_source(config->idme_dir, config->dt_idme_dir),
+        count, count == MIC_LOGICAL_CHANNELS ? "true" : "false", mics);
+#else
     n = snprintf(
         buffer, size,
         "{\"available\":%s,\"simulated\":false,"
@@ -713,6 +769,7 @@ static int format_status(char *buffer, size_t size,
         miccal_source(config->idme_dir, config->dt_idme_dir),
         count, count == MIC_LOGICAL_CHANNELS ? "true" : "false",
         mics, LE_BEAM_DEFAULT_BEAMS, LE_BEAM_FFT, LE_BEAM_HOP);
+#endif
     return n < 0 || (size_t)n >= size ? -1 : n;
 }
 
@@ -763,8 +820,8 @@ static int relay_capture(int client_fd, const struct micd_config *config)
         char *const argv[] = {
             (char *)"tinycap", (char *)"--",
             (char *)"-D", (char *)"0",
-            (char *)"-d", (char *)"24",
-            (char *)"-c", (char *)"9",
+            (char *)"-d", (char *)MIC_DEVICE_ARG,
+            (char *)"-c", (char *)MIC_RAW_ARG,
             (char *)"-r", (char *)"16000",
             (char *)"-b", (char *)"24",
             (char *)"-p", (char *)"640",
@@ -805,8 +862,8 @@ static pid_t start_capture(const struct micd_config *config, int output_fd)
         char *const argv[] = {
             (char *)"tinycap", (char *)"--",
             (char *)"-D", (char *)"0",
-            (char *)"-d", (char *)"24",
-            (char *)"-c", (char *)"9",
+            (char *)"-d", (char *)MIC_DEVICE_ARG,
+            (char *)"-c", (char *)MIC_RAW_ARG,
             (char *)"-r", (char *)"16000",
             (char *)"-b", (char *)"24",
             (char *)"-p", (char *)"640",
@@ -826,7 +883,11 @@ static pid_t start_capture(const struct micd_config *config, int output_fd)
 static int relay_capture_mono(int client_fd, const struct micd_config *config)
 {
     static const uint8_t identity_map[LE_VOICE_LOGICAL_CHANNELS] =
+#ifdef LE_TARGET_ROOK
+        {0, 1, 2, 3};
+#else
         {0, 1, 2, 3, 4, 5, 6};
+#endif
     static struct le_beamformer beamformer;
     struct le_voice_calibration calibration;
     struct le_voice_highpass highpass;
@@ -883,10 +944,23 @@ static int relay_capture_mono(int client_fd, const struct micd_config *config)
                 le_voice_decode_calibrated(
                     input + frame * LE_VOICE_RAW_FRAME_BYTES,
                     &calibration, logical);
+#ifdef LE_TARGET_ROOK
+                /* No ring to steer on the Spot: the four microphones, averaged. */
+                {
+                    int32_t sum = 0;
+                    int c;
+
+                    for (c = 0; c < LE_VOICE_LOGICAL_CHANNELS; ++c)
+                        sum += logical[c];
+                    output[frame] = le_voice_highpass_sample(
+                        &highpass, (int16_t)(sum / LE_VOICE_LOGICAL_CHANNELS));
+                }
+#else
                 output[frame] = le_voice_highpass_sample(
                     &highpass, le_beamformer_sample(&beamformer, logical));
                 if (beamformer.fill == 0)
                     beam_view_publish(&beamformer);
+#endif
             }
             apply_digital_gain(output, frames, digital_gain);
             if (write_all(client_fd, output,
@@ -969,7 +1043,7 @@ int main(int argc, char **argv)
         LE_ADAPTER_MIC_SOCK,
         "/proc/idme",
         "/sys/firmware/devicetree/base/idme",
-        "/dev/snd/pcmC0D24c",
+        "/dev/snd/pcmC0D" MIC_DEVICE_ARG "c",
         "/sbin/tinycap",
         "/sbin/tinymix"
     };

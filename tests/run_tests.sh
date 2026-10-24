@@ -286,6 +286,13 @@ cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
     src/adapter/adapter_client.c src/adapter/adapter_server.c src/log.c \
     -lm -o build/test-micd
 ./build/test-micd
+# micd for the Echo Spot (-DLE_TARGET_ROOK): PCM 22, four microphones averaged.
+make BUILD=build-rook CPPFLAGS=-DLE_TARGET_ROOK build-rook/libreecho-micd
+cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
+    -Isrc -Isrc/adapter tests/test_micd_rook.c \
+    src/adapter/adapter_client.c src/adapter/adapter_server.c src/log.c \
+    -lm -o build/test-micd-rook
+./build/test-micd-rook
 sh tests/test_waked_init_model.sh
 cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
     -Isrc -Isrc/adapter tests/test_voice_dsp.c src/adapter/voice_dsp.c \

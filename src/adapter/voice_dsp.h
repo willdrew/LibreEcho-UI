@@ -5,8 +5,14 @@
 #include <stdint.h>
 
 #define LE_VOICE_RATE 16000
+#ifdef LE_TARGET_ROOK
+/* Echo Spot: four microphones (lanes 0-3) and the playback loopback (4, 5). */
+#define LE_VOICE_RAW_CHANNELS 6
+#define LE_VOICE_LOGICAL_CHANNELS 4
+#else
 #define LE_VOICE_RAW_CHANNELS 9
 #define LE_VOICE_LOGICAL_CHANNELS 7
+#endif
 #define LE_VOICE_VALID_BITS 16
 #define LE_VOICE_BYTES_PER_SAMPLE 3
 #define LE_VOICE_RAW_FRAME_BYTES \
@@ -33,8 +39,12 @@
  * other one.  A steered or fixed-beam stage replaces this average when it
  * exists.
  */
+#ifdef LE_TARGET_ROOK
+#define LE_VOICE_WAKE_MIC_MASK 0xfU
+#else
 #define LE_VOICE_WAKE_MIC_MASK \
     ((1U << 0) | (1U << 1) | (1U << 3) | (1U << 4))
+#endif
 
 enum le_voice_calibration_mode {
     LE_VOICE_CALIBRATION_OFF = 0,
