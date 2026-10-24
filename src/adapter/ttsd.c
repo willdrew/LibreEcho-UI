@@ -1292,6 +1292,21 @@ static int render_to_file(struct tts_engine *engine, const char *text,
     return 0;
 }
 
+/*
+ * Up to two voices kept loaded (--voice and --voice-alt), so switching
+ * between them ("set_voice") is instant instead of a ~20 s daemon restart.
+ * The second costs another model in memory, so the init script only asks
+ * for it when the owner has turned it on.
+ */
+static struct tts_engine *g_voices[2];
+static const char *g_voice_names[2];
+static int g_voice_active;
+
+static struct tts_engine *active_engine(void)
+{
+    return g_voices[g_voice_active];
+}
+
 static int handle_request(struct tts_engine *engine, char *message,
                           char *response, size_t response_size)
 {
@@ -1304,12 +1319,32 @@ static int handle_request(struct tts_engine *engine, char *message,
     le_log_debug("ttsd: cmd=\"%s\" id=%lu", command, id);
 
     if (!strcmp(command, "status")) {
-        char data[128];
+        char data[256];
         (void)snprintf(data, sizeof(data),
-                       "{\"speaking\":%s,\"engine\":\"%s\"}",
+                       "{\"speaking\":%s,\"engine\":\"%s\",\"voice\":\"%s\","
+                       "\"voices_loaded\":%d}",
                        (g_active_child > 0 || g_pending_speech)
                            ? "true" : "false",
-                       LE_TTSD_ENGINE_NAME);
+                       LE_TTSD_ENGINE_NAME, g_voice_names[g_voice_active],
+                       g_voices[1] ? 2 : 1);
+        return response_ok(response, response_size, id, data);
+    }
+    if (!strcmp(command, "set_voice")) {
+        char voice[64], data[128];
+        int k;
+
+        if (json_string(message, "voice", voice, sizeof(voice)) < 0)
+            return response_error(response, response_size, id,
+                                  "missing or invalid voice field");
+        for (k = 0; k < 2; ++k)
+            if (g_voices[k] && !strcmp(g_voice_names[k], voice))
+                break;
+        if (k == 2)
+            return response_error(response, response_size, id,
+                                  "voice not loaded");
+        g_voice_active = k;
+        le_log_info("ttsd: voice now %s", voice);
+        (void)snprintf(data, sizeof(data), "{\"voice\":\"%s\"}", voice);
         return response_ok(response, response_size, id, data);
     }
     if (!strcmp(command, "speak")) {
@@ -1476,6 +1511,7 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "usage: %s [--socket PATH] [--model-dir DIR] [--voice NAME] "
+            "[--model-dir-alt DIR --voice-alt NAME] "
             "[--foreground] [--verbose] [--debug] [--quiet]\n",
             program);
 }
@@ -1485,6 +1521,8 @@ int main(int argc, char **argv)
     const char *socket_path = LE_TTS_DEFAULT_SOCKET;
     const char *model_dir = NULL;
     const char *voice = "zipvoice";
+    const char *model_dir_alt = NULL;
+    const char *voice_alt = NULL;
     int foreground = 0;
     int listen_fd;
     int i;
@@ -1505,6 +1543,10 @@ int main(int argc, char **argv)
             model_dir = argv[++i];
         } else if (!strcmp(argv[i], "--voice") && i + 1 < argc) {
             voice = argv[++i];
+        } else if (!strcmp(argv[i], "--model-dir-alt") && i + 1 < argc) {
+            model_dir_alt = argv[++i];
+        } else if (!strcmp(argv[i], "--voice-alt") && i + 1 < argc) {
+            voice_alt = argv[++i];
         } else if (!strcmp(argv[i], "--foreground")) {
             foreground = 1;
         } else if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "--debug") ||
@@ -1527,6 +1569,18 @@ int main(int argc, char **argv)
     }
     le_log_info("ttsd: TTS engine ready (native rate=%d Hz)",
                 tts_engine_sample_rate(engine));
+    g_voices[0] = engine;
+    g_voice_names[0] = voice;
+    /* The second voice is optional: without it ttsd runs as before. */
+    if (model_dir_alt && voice_alt && strcmp(voice_alt, voice)) {
+        g_voices[1] = tts_engine_init(model_dir_alt, voice_alt);
+        if (g_voices[1]) {
+            g_voice_names[1] = voice_alt;
+            le_log_info("ttsd: second voice %s ready", voice_alt);
+        } else {
+            le_log_error("ttsd: second voice %s failed; one voice only", voice_alt);
+        }
+    }
 
     /* Signal setup. */
     memset(&action, 0, sizeof(action));
@@ -1592,7 +1646,7 @@ int main(int argc, char **argv)
                 continue;
             }
             if ((revents & POLLIN) &&
-                read_client(engine, &clients[client_index]) < 0) {
+                read_client(active_engine(), &clients[client_index]) < 0) {
                 close_client(&clients[client_index]);
                 continue;
             }
@@ -1625,7 +1679,7 @@ int main(int argc, char **argv)
                 g_pending_text[0] = '\0';
                 g_pending_request_id[0] = '\0';
                 g_pending_speech = 0;
-                if (start_speech(engine, text, request_id) < 0)
+                if (start_speech(active_engine(), text, request_id) < 0)
                     le_log_error("ttsd: queued in-process speech failed");
             }
         }
@@ -1639,5 +1693,7 @@ int main(int argc, char **argv)
     close(listen_fd);
     (void)unlink(socket_path);
     tts_engine_destroy(engine);
+    if (g_voices[1])
+        tts_engine_destroy(g_voices[1]);
     return EXIT_SUCCESS;
 }

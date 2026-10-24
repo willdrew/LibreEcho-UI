@@ -19,6 +19,8 @@ MODEL_ROOT=${MODEL_ROOT:-$RUNTIME_ROOT/usr/local/share/libreecho/tts/models}
 VOICE_FILE=${VOICE_FILE:-/data/libreecho/config/tts-voice}
 CONFIG=${CONFIG:-/data/libreecho/config/web-config.json}
 WYOMING_DAEMON=${WYOMING_DAEMON:-/usr/local/sbin/libreecho-ttsd-wyoming}
+DUAL_FILE=${DUAL_FILE:-/data/libreecho/config/tts-dual-voice}
+DUAL_MIN_KB=${DUAL_MIN_KB:-200000}
 
 config_string() {
     key=$1
@@ -142,6 +144,21 @@ start_service() {
             return 1
         }
         ARGS=${ARGS:---foreground --socket $SOCKET --model-dir $MODEL_DIR --voice $VOICE}
+        # Owner opt-in ($DUAL_FILE): keep the other voice loaded too, so a
+        # switch is instant ("set_voice"). Each voice is ~90 MB, so only with
+        # DUAL_MIN_KB available.
+        if [ -e "$DUAL_FILE" ]; then
+            case "$VOICE" in
+                southern-female) ALT=northern-male ;;
+                *) ALT=southern-female ;;
+            esac
+            avail=$(sed -n 's/^MemAvailable:[[:space:]]*\([0-9]*\) kB/\1/p' /proc/meminfo)
+            if [ -f "$MODEL_ROOT/$ALT/model.onnx" ] && [ "${avail:-0}" -ge "$DUAL_MIN_KB" ]; then
+                ARGS="$ARGS --model-dir-alt $MODEL_ROOT/$ALT --voice-alt $ALT"
+            else
+                echo "libreecho-ttsd: second voice skipped (${avail:-?} kB available)" >>"$LOGFILE"
+            fi
+        fi
     fi
     export LE_TTS_THREADS=${LE_TTS_THREADS:-4}
     export LE_TTS_STREAMING=${LE_TTS_STREAMING:-1}
