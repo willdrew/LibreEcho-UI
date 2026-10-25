@@ -9,6 +9,7 @@
 #define LE_TARGET_ROOK 1
 #define LE_MASTER_VOLUME_DIR "/tmp/libreecho-audiod-rook-volume"
 #define LE_MASTER_VOLUME_PATH LE_MASTER_VOLUME_DIR "/master.volume"
+#define VOLUME_MAX_FILE "/tmp/libreecho-audiod-rook-volume-max"
 #define main audiod_program_main
 #include "../src/adapter/audiod.c"
 #undef main
@@ -37,6 +38,8 @@ int main(void)
     struct audio_hw audio;
 
     unsetenv("LE_AUDIO_VOLUME_MAX");
+    setenv("LE_AUDIO_VOLUME_MAX_FILE", VOLUME_MAX_FILE, 1);
+    unlink(VOLUME_MAX_FILE);
     expect(rook_engine_volume(0), 0, "0 is mute");
     expect(rook_engine_volume(100), 12, "100 is the safe top");
     expect(rook_engine_volume(50), 6, "50 is half of it");
@@ -49,6 +52,17 @@ int main(void)
     setenv("LE_AUDIO_VOLUME_MAX", "junk", 1);
     expect(rook_engine_volume(100), 12, "a bad top falls back to 12");
     unsetenv("LE_AUDIO_VOLUME_MAX");
+    /* The top from a file (spot-start.sh writes it once the engine's trim is in place), read each
+     * time; the environment still wins; a bad file falls back to the safe default. */
+    put(VOLUME_MAX_FILE, "50\n");
+    expect(rook_engine_volume(100), 50, "the top from the file");
+    expect(rook_engine_volume(10), 5, "the file's scale");
+    setenv("LE_AUDIO_VOLUME_MAX", "20", 1);
+    expect(rook_engine_volume(100), 20, "the environment beats the file");
+    unsetenv("LE_AUDIO_VOLUME_MAX");
+    put(VOLUME_MAX_FILE, "junk\n");
+    expect(rook_engine_volume(100), 12, "a bad file falls back to 12");
+    unlink(VOLUME_MAX_FILE);
 
     /* A restart reads master.volume (the engine's level) back: the owner's number beside it wins
      * when it still matches; otherwise the nearest owner number. */

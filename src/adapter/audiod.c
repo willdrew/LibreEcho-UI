@@ -1078,16 +1078,29 @@ static int ensure_volume_directory(void)
  */
 #define ROOK_VOLUME_MAX_DEFAULT 12
 
+/* The top: LE_AUDIO_VOLUME_MAX, else the file LE_AUDIO_VOLUME_MAX_FILE (default
+ * /run/libreecho/volume-max, which spot-start.sh writes only once the engine's master trim is in
+ * place, so a louder top never meets an untrimmed engine), else the safe default. */
 static int rook_volume_max(void)
 {
-    const char *text = getenv("LE_AUDIO_VOLUME_MAX");
-    char *end;
+    const char *text = getenv("LE_AUDIO_VOLUME_MAX"), *path;
+    char buffer[16], *end;
     long max;
+    FILE *f;
 
-    if (!text || !*text)
-        return ROOK_VOLUME_MAX_DEFAULT;
+    if (!text || !*text) {
+        path = getenv("LE_AUDIO_VOLUME_MAX_FILE");
+        f = fopen(path && *path ? path : "/run/libreecho/volume-max", "r");
+        if (!f)
+            return ROOK_VOLUME_MAX_DEFAULT;
+        text = fgets(buffer, sizeof(buffer), f);
+        fclose(f);
+        if (!text)
+            return ROOK_VOLUME_MAX_DEFAULT;
+        buffer[strcspn(buffer, "\n")] = '\0';
+    }
     max = strtol(text, &end, 10);
-    if (*end || max < 1)
+    if (end == text || *end || max < 1)
         return ROOK_VOLUME_MAX_DEFAULT;
     return max > 100 ? 100 : (int)max;
 }
