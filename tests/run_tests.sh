@@ -296,6 +296,10 @@ cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
 ./build/test-micd-rook
 sh tests/test_capture_mux_rook.sh
 sh tests/test_audiod_rook_mute.sh
+mkdir -p build-rook
+cc -D_POSIX_C_SOURCE=200809L -std=c11 -Wall -Wextra -Werror -Isrc -Isrc/adapter tests/test_audiod_rook_volume.c \
+    src/adapter/adapter_client.c src/adapter/adapter_server.c src/log.c -lm -o build-rook/test-audiod-rook-volume
+./build-rook/test-audiod-rook-volume
 sh tests/test_waked_init_model.sh
 cc -D_POSIX_C_SOURCE=200809L -std=c99 -Wall -Wextra -Wpedantic -Werror \
     -Isrc -Isrc/adapter tests/test_voice_dsp.c src/adapter/voice_dsp.c \

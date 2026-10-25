@@ -1067,6 +1067,75 @@ static int ensure_volume_directory(void)
     return 0;
 }
 
+#ifdef LE_TARGET_ROOK
+/*
+ * The engine's taper was set for the Dot's small speaker; on the Echo Spot's louder amplifier
+ * logical 10 was already near full and 20 distorted the speaker (owner report, 2026-10-25). So
+ * the owner's 0..100 is scaled into 0..LE_AUDIO_VOLUME_MAX (default 12) before the engine sees it:
+ * 0 stays mute and any level above 0 is at least 1. This covers every path (buttons, voice, web,
+ * the ringer's alarm level), since all of them set the volume here. The owner's own number is
+ * kept in master.volume.owner so a restart shows it again.
+ */
+#define ROOK_VOLUME_MAX_DEFAULT 12
+
+static int rook_volume_max(void)
+{
+    const char *text = getenv("LE_AUDIO_VOLUME_MAX");
+    char *end;
+    long max;
+
+    if (!text || !*text)
+        return ROOK_VOLUME_MAX_DEFAULT;
+    max = strtol(text, &end, 10);
+    if (*end || max < 1)
+        return ROOK_VOLUME_MAX_DEFAULT;
+    return max > 100 ? 100 : (int)max;
+}
+
+static int rook_engine_volume(int volume)
+{
+    int engine;
+
+    if (volume <= 0)
+        return 0;
+    engine = (volume * rook_volume_max() + 50) / 100;
+    return engine < 1 ? 1 : engine;
+}
+
+static int rook_owner_volume(int engine)
+{
+    int max = rook_volume_max(), owner;
+
+    if (engine <= 0)
+        return 0;
+    owner = (engine * 100 + max / 2) / max;
+    return owner > 100 ? 100 : owner;
+}
+
+static void rook_save_owner_volume(int volume)
+{
+    FILE *f = fopen(LE_MASTER_VOLUME_PATH ".owner", "w");
+
+    if (!f)
+        return;
+    fprintf(f, "%d\n", volume);
+    fclose(f);
+}
+
+static int rook_load_owner_volume(int engine)
+{
+    FILE *f = fopen(LE_MASTER_VOLUME_PATH ".owner", "r");
+    int owner = -1;
+
+    if (f) {
+        if (fscanf(f, "%d", &owner) != 1 || owner < 0 || owner > 100)
+            owner = -1;
+        fclose(f);
+    }
+    return owner >= 0 && rook_engine_volume(owner) == engine ? owner : rook_owner_volume(engine);
+}
+#endif
+
 static int audio_set_volume(struct audio_hw *audio, int volume)
 {
     char temp[sizeof(LE_MASTER_VOLUME_PATH) + 16], text[8];
@@ -1074,7 +1143,12 @@ static int audio_set_volume(struct audio_hw *audio, int volume)
     if (volume < 0 || volume > 100) return -1;
     if (ensure_physical_reference(audio) < 0 || ensure_volume_directory() < 0)
         return -1;
+#ifdef LE_TARGET_ROOK
+    n = snprintf(text, sizeof(text), "%d\n", rook_engine_volume(volume));
+    rook_save_owner_volume(volume);
+#else
     n = snprintf(text, sizeof(text), "%d\n", volume);
+#endif
     if (snprintf(temp, sizeof(temp), "%s.tmp.XXXXXX", LE_MASTER_VOLUME_PATH) >= (int)sizeof(temp)) return -1;
     fd = mkstemp(temp);
     if (fd < 0) return -1;
@@ -1213,6 +1287,9 @@ static int audio_load_logical_volume(struct audio_hw *audio)
     value = (int)parsed;
     length = snprintf(canonical, sizeof(canonical), "%d\n", value);
     if (size != length || memcmp(text, canonical, (size_t)length)) return -1;
+#ifdef LE_TARGET_ROOK
+    value = rook_load_owner_volume(value);
+#endif
     audio->volume = audio->notification_volume = value;
     audio->requested_volume = value;
     return 0;
