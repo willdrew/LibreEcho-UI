@@ -988,8 +988,12 @@ static void refresh_state(struct audio_hw *audio)
                       : audio->capture.info.value.integer.max;
         audio->gain = percent_from_range(value, min, max);
     }
+#ifndef LE_TARGET_ROOK
+    /* On the Spot the codec's switch is not the microphones' mute; the flag
+       capture-mux obeys is, and audio->muted already says which. */
     if (read_control_value(audio, &audio->capture_switch, &value) == 0)
         audio->muted = audio->capture_switch.mute_semantics ? (value != 0) : (value == 0);
+#endif
 }
 
 static int amplifier_active(const struct audio_hw *audio)
@@ -1103,9 +1107,42 @@ static int audio_set_gain(struct audio_hw *audio, int gain)
     return 0;
 }
 
+#ifdef LE_TARGET_ROOK
+/*
+ * The Echo Spot's codec has no capture switch: written to, nothing changes and
+ * the microphones stay live (measured 2026-10-25, the room's noise energy was
+ * the same "muted" as not). There, mute is a file capture-mux obeys -- it
+ * forwards silence while the file exists. Across a reboot the mute is the
+ * web's saved setting (microphone_muted), applied at its start as on the Dots.
+ */
+static const char *rook_mute_path(const char *env, const char *fallback)
+{
+    const char *text = getenv(env);
+    return text && *text ? text : fallback;
+}
+
+static int rook_set_mute_flag(int muted)
+{
+    const char *path = rook_mute_path("LE_AUDIO_MUTE_FILE", "/run/libreecho/mic-muted");
+    int fd;
+
+    if (!muted)
+        return unlink(path) < 0 && errno != ENOENT ? -1 : 0;
+    fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    return fd < 0 || close(fd) < 0 ? -1 : 0;
+}
+#endif
+
 static int audio_set_mute(struct audio_hw *audio, int muted)
 {
     const char *setting = muted ? "nocap" : "cap";
+#ifdef LE_TARGET_ROOK
+    (void)setting;
+    if (rook_set_mute_flag(muted) < 0)
+        return -1;
+    audio->muted = !!muted;
+    return 0;
+#endif
     if (write_switch_control(audio, &audio->capture_switch, muted) < 0) {
         if (run_amixer(audio,
                        control_name_or_default(&audio->capture_switch,
@@ -2784,6 +2821,11 @@ int main(int argc, char **argv)
     (void)sigaction(SIGCHLD, &child_action, NULL);
 
     audio_init(&audio, card);
+#ifdef LE_TARGET_ROOK
+    /* Start unmuted, as the state reports: a flag left by a previous run would
+       silence the microphones behind a status that says they are live. */
+    (void)audio_set_mute(&audio, 0);
+#endif
     snprintf(audio.airplay_controller_socket, sizeof(audio.airplay_controller_socket),
              "%s", LE_ADAPTER_AIRPLAY_SOCK);
     airplay_restore_load(&audio);

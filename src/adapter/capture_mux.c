@@ -38,7 +38,24 @@
 
 #include "mic_array_render.h"
 
+#ifdef LE_TARGET_ROOK
+/*
+ * The Echo Spot: PCM 22 has six lanes, four microphones (0-3) and the playback
+ * loopback (4, 5). Its micd averages the four rather than beamforming, so the
+ * injected talker goes onto each microphone as is, and the loopback stays silent.
+ */
+#define CHANNELS 6
+#define ROOK_MICS 4
+/*
+ * Mute. The Spot's codec has no capture switch, so audiod's set_mute (built for
+ * the Spot) leaves this file instead, and while it exists every microphone
+ * period is forwarded as digital silence: waked, the recogniser and anything
+ * else downstream hear nothing from the room. Checked once a period (40 ms).
+ */
+#define ROOK_MUTE_FILE "/run/libreecho/mic-muted"
+#else
 #define CHANNELS 9
+#endif
 #define PERIOD 640                  /* 40 ms at 16 kHz, matching micd */
 #define RATE 16000
 /*
@@ -100,8 +117,13 @@ static pid_t spawn_capture(const char *bin, int *out_fd)
          */
         char *const argv[] = {
             (char *)"tinycap", (char *)"--",
+#ifdef LE_TARGET_ROOK
+            (char *)"-D", (char *)"0", (char *)"-d", (char *)"22",
+            (char *)"-c", (char *)"6", (char *)"-r", (char *)"16000",
+#else
             (char *)"-D", (char *)"0", (char *)"-d", (char *)"24",
             (char *)"-c", (char *)"9", (char *)"-r", (char *)"16000",
+#endif
             (char *)"-b", (char *)"24", (char *)"-p", (char *)"640",
             (char *)"-n", (char *)"4", NULL
         };
@@ -139,6 +161,9 @@ int main(int argc, char **argv)
 {
     const char *capture_bin = "/sbin/tinycap";
     const char *control_dir = "/run/libreecho/mic-inject";
+#ifdef LE_TARGET_ROOK
+    const char *mute_file = ROOK_MUTE_FILE;
+#endif
     char pending[512], active[512];
     unsigned char passthrough[PERIOD * CHANNELS * 3];
     unsigned char frame[PERIOD * CHANNELS * 3];
@@ -162,6 +187,11 @@ int main(int argc, char **argv)
         text = getenv("LE_CAPTURE_MUX_CONTROL_DIR");
         if (text && *text)
             control_dir = text;
+#ifdef LE_TARGET_ROOK
+        text = getenv("LE_CAPTURE_MUX_MUTE_FILE");
+        if (text && *text)
+            mute_file = text;
+#endif
     }
     for (i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--capture-bin") && i + 1 < argc)
@@ -217,9 +247,13 @@ int main(int argc, char **argv)
 
                     le_array_render_push(&render, (float)mono[s]);
                     for (c = 0; c < CHANNELS; ++c) {
+#ifdef LE_TARGET_ROOK
+                        float v = c < ROOK_MICS ? (float)mono[s] : 0.0f;
+#else
                         float v = c < LE_ARRAY_RENDER_MICS
                             ? le_array_render_lane(&render, (unsigned int)c)
                             : 0.0f;
+#endif
                         long q = lrintf(v);
                         if (q > INT16_MAX) q = INT16_MAX;
                         if (q < INT16_MIN) q = INT16_MIN;
@@ -232,6 +266,10 @@ int main(int argc, char **argv)
                 continue;
             }
         }
+#ifdef LE_TARGET_ROOK
+        if (access(mute_file, F_OK) == 0)
+            memset(passthrough, 0, sizeof(passthrough));
+#endif
         if (write_all(STDOUT_FILENO, passthrough, sizeof(passthrough)) < 0)
             break;
     }
