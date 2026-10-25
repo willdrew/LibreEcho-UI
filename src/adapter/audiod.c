@@ -803,10 +803,37 @@ static int is_speaker_pcm_volume(const struct audio_control *control)
     return control->found && !strcmp(control->name, "PCM Playback Volume");
 }
 
+#ifdef LE_TARGET_ROOK
+/*
+ * The Echo Spot's codec reference: PCM Playback Volume (0.5 dB a step, 127 = 0 dB) stays at 127,
+ * the engine's check, unless spot-start.sh has installed the Spot's engine (the image's with that
+ * check moved) and written its value to LE_AUDIO_CODEC_REF_FILE (default
+ * /run/libreecho/codec-ref). Then the codec takes the cut and the digital levels rise by as much
+ * (rook_engine_step), so music lands where it did and speech, at the engine's floor, comes down.
+ */
+static int rook_codec_ref(void)
+{
+    const char *path = getenv("LE_AUDIO_CODEC_REF_FILE");
+    FILE *f = fopen(path && *path ? path : "/run/libreecho/codec-ref", "r");
+    int ref = 127;
+
+    if (f) {
+        if (fscanf(f, "%d", &ref) != 1 || ref < 40 || ref > 127)
+            ref = 127;
+        fclose(f);
+    }
+    return ref;
+}
+#endif
+
 static long long speaker_value_for_percent(long long min, long long max,
                                            int percent)
 {
+#ifdef LE_TARGET_ROOK
+    long long unity = min + rook_codec_ref();
+#else
     long long unity = min + 127;
+#endif
     long long floor = min + 67;
 
     if (unity > max)
@@ -1112,7 +1139,8 @@ static int rook_engine_step(int volume, double *trim)
     *trim = 0.0;
     if (volume <= 0)
         return 0;
-    target = low + (high - low) * (volume - 1) / 99.0;
+    /* The codec's cut comes back as digital level. */
+    target = low + (high - low) * (volume - 1) / 99.0 + (127 - rook_codec_ref()) / 2.0;
     for (step = 1; step < 100 && rook_engine_db(step) < target; ++step)
         ;
     *trim = target - rook_engine_db(step);

@@ -11,6 +11,7 @@
 #define LE_TARGET_ROOK 1
 #define LE_MASTER_VOLUME_DIR "/tmp/libreecho-audiod-rook-volume"
 #define LE_MASTER_VOLUME_PATH LE_MASTER_VOLUME_DIR "/master.volume"
+#define CODEC_REF_FILE "/tmp/libreecho-audiod-rook-codec-ref"
 #define main audiod_program_main
 #include "../src/adapter/audiod.c"
 #undef main
@@ -69,6 +70,32 @@ int main(void)
     setenv("LE_AUDIO_SPOT_MAX_DB", "-10", 1);
     expect(fabs(rook_engine_db(rook_engine_step(100, &trim)) + trim + 30.0) < 0.05, "the top is never above -30 dB");
     unsetenv("LE_AUDIO_SPOT_MAX_DB");
+
+    /* The codec's own volume (PCM Playback Volume, 0.5 dB a step, 127 = 0 dB) stays at the engine's
+     * reference, 127, unless spot-start.sh has installed an engine that checks for a lower one and
+     * says so in LE_AUDIO_CODEC_REF_FILE: then audiod sets the codec there, and the digital levels
+     * rise by the same amount, so music lands where it did and speech, held at the engine's
+     * floor, comes down with the codec. */
+    setenv("LE_AUDIO_CODEC_REF_FILE", CODEC_REF_FILE, 1);
+    unlink(CODEC_REF_FILE);
+    expect(rook_codec_ref() == 127, "no file: the codec at 0 dB");
+    expect(speaker_value_for_percent(0, 175, 100) == 127, "no file: audiod writes 127");
+    put(CODEC_REF_FILE, "79\n");
+    expect(rook_codec_ref() == 79, "the file: 79");
+    expect(speaker_value_for_percent(0, 175, 100) == 79, "the file: audiod writes 79");
+    for (v = 1; v <= 100; ++v) {
+        double want = -80.0 + 31.0 * (v - 1) / 99.0 + 24.0;
+
+        step = rook_engine_step(v, &trim);
+        snprintf(what, sizeof(what), "codec -24 dB, volume %d: digital %.1f, want %.1f", v,
+                 rook_engine_db(step) + trim, want);
+        expect(fabs(rook_engine_db(step) + trim - want) < 0.05 && trim <= 0.0, what);
+    }
+    put(CODEC_REF_FILE, "200\n");
+    expect(rook_codec_ref() == 127, "a bad file: 127");
+    put(CODEC_REF_FILE, "10\n");
+    expect(rook_codec_ref() == 127, "below the floor: 127");
+    unlink(CODEC_REF_FILE);
 
     /* A restart reads master.volume (the engine's step) back: the owner's number beside it wins
      * when it still matches; otherwise the nearest owner number. */
