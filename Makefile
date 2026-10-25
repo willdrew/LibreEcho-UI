@@ -584,6 +584,12 @@ $(BUILD)/test-diagnostic-export: tests/test_diagnostic_export.c src/json.c src/f
 	$(CC) -D_POSIX_C_SOURCE=200809L $(CSTD) $(WARN) -Werror \
 		-ffunction-sections -fdata-sections -Wl,--gc-sections -Isrc $^ -o $@
 
+$(BUILD)/test-radiod-bus: tests/test_radiod_bus.c src/adapter/radiod.c src/json.c $(RADIOD_CODEC_SOURCES) $(HELIX_AAC_OBJECTS)
+	@mkdir -p $(BUILD)
+	$(CC) -D_POSIX_C_SOURCE=200809L $(CSTD) $(WARN) -Werror \
+		-ffunction-sections -fdata-sections -Wl,--gc-sections \
+		-Isrc -Isrc/adapter $(HELIX_AAC_CPPFLAGS) $< src/json.c $(RADIOD_CODEC_SOURCES) $(HELIX_AAC_OBJECTS) -lm -o $@
+
 $(BUILD)/test-radiod-json: tests/test_radiod_json.c src/adapter/radiod.c src/json.c $(RADIOD_CODEC_SOURCES) $(HELIX_AAC_OBJECTS)
 	@mkdir -p $(BUILD)
 	$(CC) -D_POSIX_C_SOURCE=200809L $(CSTD) $(WARN) -Werror \

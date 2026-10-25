@@ -79,6 +79,39 @@
 
 static volatile sig_atomic_t running = 1;
 static pid_t player_pid = -1;
+
+/*
+ * The media bus. A live stream's network hiccups must not empty it: the audio engine closes the
+ * speaker stream after about 0.34 s without data, and the amplifier pops off and back on (heard on
+ * the Echo Spot every 10-20 s, 2026-10-25). So it is opened with a 512 KiB pipe, about 2.7 s at
+ * 48 kHz stereo, which a server's connect burst fills; and since a stop or pause must not leave
+ * that much playing, the bus is emptied then (flush_bus reads it out as a second reader).
+ */
+#define MEDIA_BUS_PIPE_BYTES (512 * 1024)
+static const char *media_bus = BUS_PATH;
+
+static int open_media_bus(const char *path)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+
+#ifdef F_SETPIPE_SZ
+    if (fd >= 0)
+        (void)fcntl(fd, F_SETPIPE_SZ, MEDIA_BUS_PIPE_BYTES);
+#endif
+    return fd;
+}
+
+static void flush_bus(void)
+{
+    char chunk[16384];
+    int fd = open(media_bus, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+
+    if (fd < 0)
+        return;
+    while (read(fd, chunk, sizeof(chunk)) > 0)
+        ;
+    close(fd);
+}
 static int player_paused;
 static char playing_url[URL_MAX];
 /*
@@ -1032,7 +1065,7 @@ static int play_hls_stream(const char *url, const char *bus_path, long *played,
 #ifdef F_SETPIPE_SZ
     (void)fcntl(fds[1], F_SETPIPE_SZ, HLS_PIPE_BYTES);
 #endif
-    bus = open(bus_path, O_WRONLY | O_CLOEXEC);
+    bus = open_media_bus(bus_path);
     if (bus < 0) {
         close(fds[0]);
         close(fds[1]);
@@ -1147,7 +1180,7 @@ static int play_stream(const char *url, const char *bus_path, long *played,
         if (station[0])
             publish_metadata('N', station);
     }
-    bus = open(bus_path, O_WRONLY | O_CLOEXEC);
+    bus = open_media_bus(bus_path);
     if (bus < 0)
         goto done;
     if (is_ogg) {
@@ -1298,6 +1331,8 @@ static int set_player_paused(int paused)
         return 0;
     if (kill(player_pid, paused ? SIGSTOP : SIGCONT) < 0)
         return -1;
+    if (paused)
+        flush_bus();
     for (i = 0; i < PLAYER_WAIT_STEPS; ++i) {
         do {
             done = waitpid(player_pid, &status,
@@ -1324,7 +1359,7 @@ static int set_player_paused(int paused)
     return -1;
 }
 
-static int stop_player(void)
+static int stop_player_wait(void)
 {
     unsigned int i;
 
@@ -1347,6 +1382,16 @@ static int stop_player(void)
     }
     reap_player();
     return player_pid <= 0 ? 0 : -1;
+}
+
+/* Stopped: what is still in the bus would go on playing for seconds, so empty it. */
+static int stop_player(void)
+{
+    int rc = stop_player_wait();
+
+    if (rc == 0)
+        flush_bus();
+    return rc;
 }
 
 static int start_player(const char *url, const char *bus_path)
@@ -1501,6 +1546,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--bus") && i + 1 < argc)
             bus_path = argv[++i];
     }
+    media_bus = bus_path;
 
     install_stop_handlers();
     signal(SIGPIPE, SIG_IGN);
