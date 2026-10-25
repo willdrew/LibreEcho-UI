@@ -1069,60 +1069,79 @@ static int ensure_volume_directory(void)
 
 #ifdef LE_TARGET_ROOK
 /*
- * The engine's taper was set for the Dot's small speaker; on the Echo Spot's louder amplifier
- * logical 10 was already near full and 20 distorted the speaker (owner report, 2026-10-25). So
- * the owner's 0..100 is scaled into 0..LE_AUDIO_VOLUME_MAX (default 12) before the engine sees it:
- * 0 stays mute and any level above 0 is at least 1. This covers every path (buttons, voice, web,
- * the ringer's alarm level), since all of them set the volume here. The owner's own number is
- * kept in master.volume.owner so a restart shows it again.
+ * The engine's taper was set for the Dot's small speaker. On the Echo Spot's far hotter amplifier
+ * even its quietest master step (-60 dB) was too loud for music, and logical 20 distorted (owner,
+ * 2026-10-25); a rebuilt engine with a master trim crashed the kernel, so the trim lives here. The
+ * owner's 1..100 is a target level, linear in dB from LE_AUDIO_SPOT_MIN_DB (-80) to
+ * LE_AUDIO_SPOT_MAX_DB (-49, at most -30): the engine's master takes the lowest step at or above it
+ * (never below its floor) and music the rest as media.volume, so radio and WeatherStar follow the
+ * target exactly; speech and chimes follow the master alone. Every path (buttons, voice, web, the
+ * ringer's alarm level) sets the volume here. The owner's own number is kept in
+ * master.volume.owner so a restart shows it again.
  */
-#define ROOK_VOLUME_MAX_DEFAULT 12
-
-/* The top: LE_AUDIO_VOLUME_MAX, else the file LE_AUDIO_VOLUME_MAX_FILE (default
- * /run/libreecho/volume-max, which spot-start.sh writes only once the engine's master trim is in
- * place, so a louder top never meets an untrimmed engine), else the safe default. */
-static int rook_volume_max(void)
+static double rook_env_db(const char *name, double fallback, double low, double high)
 {
-    const char *text = getenv("LE_AUDIO_VOLUME_MAX"), *path;
-    char buffer[16], *end;
-    long max;
-    FILE *f;
+    const char *text = getenv(name);
+    char *end;
+    double value;
 
-    if (!text || !*text) {
-        path = getenv("LE_AUDIO_VOLUME_MAX_FILE");
-        f = fopen(path && *path ? path : "/run/libreecho/volume-max", "r");
-        if (!f)
-            return ROOK_VOLUME_MAX_DEFAULT;
-        text = fgets(buffer, sizeof(buffer), f);
-        fclose(f);
-        if (!text)
-            return ROOK_VOLUME_MAX_DEFAULT;
-        buffer[strcspn(buffer, "\n")] = '\0';
-    }
-    max = strtol(text, &end, 10);
-    if (end == text || *end || max < 1)
-        return ROOK_VOLUME_MAX_DEFAULT;
-    return max > 100 ? 100 : (int)max;
+    if (!text || !*text)
+        return fallback;
+    value = strtod(text, &end);
+    if (end == text || *end || value != value)
+        return fallback;
+    return value < low ? low : value > high ? high : value;
 }
 
-static int rook_engine_volume(int volume)
+/* The engine's own taper (audio_engine.c logical_master_raw), in dB. */
+static double rook_engine_db(int step)
 {
-    int engine;
+    double x = (double)(step - 1) / 99.0;
+    int raw = 103 - (int)floor(96.0 * pow(1.0 - x, 1.3) + 0.5);
 
+    return ((double)raw - 127.0) / 2.0;
+}
+
+static int rook_engine_step(int volume, double *trim)
+{
+    double low = rook_env_db("LE_AUDIO_SPOT_MIN_DB", -80.0, -100.0, -40.0);
+    double high = rook_env_db("LE_AUDIO_SPOT_MAX_DB", -49.0, low + 1.0, -30.0);
+    double target;
+    int step;
+
+    *trim = 0.0;
     if (volume <= 0)
         return 0;
-    engine = (volume * rook_volume_max() + 50) / 100;
-    return engine < 1 ? 1 : engine;
+    target = low + (high - low) * (volume - 1) / 99.0;
+    for (step = 1; step < 100 && rook_engine_db(step) < target; ++step)
+        ;
+    *trim = target - rook_engine_db(step);
+    if (*trim > 0.0)
+        *trim = 0.0;
+    return step;
 }
 
 static int rook_owner_volume(int engine)
 {
-    int max = rook_volume_max(), owner;
+    double trim;
+    int owner;
 
     if (engine <= 0)
         return 0;
-    owner = (engine * 100 + max / 2) / max;
-    return owner > 100 ? 100 : owner;
+    for (owner = 1; owner < 100; ++owner)
+        if (rook_engine_step(owner + 1, &trim) > engine)
+            break;
+    return owner;
+}
+
+static void rook_write_media_trim(double trim)
+{
+    FILE *f = fopen(LE_MASTER_VOLUME_DIR "/media.volume", "w");
+
+    if (!f)
+        return;
+    fprintf(f, "%.2f\n", trim);
+    fclose(f);
 }
 
 static void rook_save_owner_volume(int volume)
@@ -1138,6 +1157,7 @@ static void rook_save_owner_volume(int volume)
 static int rook_load_owner_volume(int engine)
 {
     FILE *f = fopen(LE_MASTER_VOLUME_PATH ".owner", "r");
+    double trim;
     int owner = -1;
 
     if (f) {
@@ -1145,7 +1165,7 @@ static int rook_load_owner_volume(int engine)
             owner = -1;
         fclose(f);
     }
-    return owner >= 0 && rook_engine_volume(owner) == engine ? owner : rook_owner_volume(engine);
+    return owner >= 0 && rook_engine_step(owner, &trim) == engine ? owner : rook_owner_volume(engine);
 }
 #endif
 
@@ -1157,7 +1177,14 @@ static int audio_set_volume(struct audio_hw *audio, int volume)
     if (ensure_physical_reference(audio) < 0 || ensure_volume_directory() < 0)
         return -1;
 #ifdef LE_TARGET_ROOK
-    n = snprintf(text, sizeof(text), "%d\n", rook_engine_volume(volume));
+    {
+        double trim;
+        int step = rook_engine_step(volume, &trim);
+
+        /* The music trim first: a louder master never meets the old, smaller cut. */
+        rook_write_media_trim(trim);
+        n = snprintf(text, sizeof(text), "%d\n", step);
+    }
     rook_save_owner_volume(volume);
 #else
     n = snprintf(text, sizeof(text), "%d\n", volume);
