@@ -224,6 +224,7 @@ make build/test-home-assistant-discovery
 ./build/test-home-assistant-discovery
 sh tests/test_wake_led.sh
 sh tests/test_led_visualizer.sh
+sh tests/test_ledd_frame_file.sh
 make build/libreecho-radiod
 make build/test-radiod-json
 ./build/test-radiod-json

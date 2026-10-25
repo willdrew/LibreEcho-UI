@@ -1253,9 +1253,32 @@ static void detect_is31(struct hardware *hw)
     closedir(dir);
 }
 
+/*
+ * --frame-file: the ring's pixels go to a plain file in the IS31FL3236 frame
+ * format (whole codes, no scaled levels), for a device without a ring that
+ * draws it some other way -- the Echo Spot's screen paints it round the rim.
+ */
+static int hardware_use_frame_file(struct hardware *hw, const char *path)
+{
+    int fd;
+
+    memset(hw, 0, sizeof(*hw));
+    if (strlen(path) >= sizeof(hw->is31_frame_path))
+        return -1;
+    fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0 || close(fd) != 0) {
+        le_log_error("could not create LED frame file %s", path);
+        return -1;
+    }
+    strncpy(hw->is31_frame_path, path, sizeof(hw->is31_frame_path) - 1);
+    hw->kind = HW_IS31FL3236;
+    le_log_info("using LED frame file %s", path);
+    return 0;
+}
+
 static int hardware_claim(const struct hardware *hw)
 {
-    if (hw->kind != HW_IS31FL3236)
+    if (hw->kind != HW_IS31FL3236 || hw->is31_boot_animation_path[0] == '\0')
         return 0;
     /* The kernel driver owns the ring's boot chase until this write. */
     if (write_text_file(hw->is31_boot_animation_path, "0\n") != 0) {
@@ -3948,7 +3971,7 @@ static int daemonize_process(void)
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s [--socket PATH] [--foreground] [--stub] [--startup-animation] [--startup-ready PATH]\n",
+    fprintf(stderr, "usage: %s [--socket PATH] [--foreground] [--stub] [--startup-animation] [--startup-ready PATH] [--frame-file PATH]\n",
             program);
 }
 
@@ -3958,6 +3981,7 @@ int main(int argc, char **argv)
     struct sigaction action;
     int force_stub = 0;
     int startup_animation_requested = 0;
+    const char *frame_file = NULL;
     int i;
 
     memset(&ctx, 0, sizeof(ctx));
@@ -3994,6 +4018,9 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             strncpy(ctx.socket_path, argv[i], sizeof(ctx.socket_path) - 1);
+        } else if (strcmp(argv[i], "--frame-file") == 0 && i + 1 < argc &&
+                   argv[i + 1][0] != '\0') {
+            frame_file = argv[++i];
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "--debug") == 0 ||
                    strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "--syslog") == 0) {
             /* handled by le_log_init */
@@ -4053,7 +4080,12 @@ int main(int argc, char **argv)
      * display; stop_startup_animation() then applies "current", which now
      * really is the owner's setting.
      */
-    hardware_detect(&ctx.hw, force_stub);
+    if (frame_file != NULL) {
+        if (hardware_use_frame_file(&ctx.hw, frame_file) != 0)
+            return EXIT_FAILURE;
+    } else {
+        hardware_detect(&ctx.hw, force_stub);
+    }
     if (hardware_claim(&ctx.hw) != 0)
         return EXIT_FAILURE;
     apply_base_state(&ctx, monotonic_seconds());
