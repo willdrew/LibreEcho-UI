@@ -3143,9 +3143,12 @@ static void update_animation(struct daemon_context *ctx, double now)
             output.brightness = ctx->test_saved.brightness;
             hardware_apply(ctx, &output);
         }
-    } else if (ctx->pattern_active) {
+    } else if (ctx->pattern_active &&
+               !(ctx->meter_active && !strcmp(ctx->pattern_owner, "mute"))) {
         update_pattern(ctx, now);
     } else if (ctx->meter_active) {
+        /* The volume level shows over the persistent mute ring while it holds,
+           so a muted Echo still acknowledges the volume buttons. */
         apply_meter(ctx);
     } else if (ctx->visualizer_active) {
         apply_visualizer(ctx, now);
