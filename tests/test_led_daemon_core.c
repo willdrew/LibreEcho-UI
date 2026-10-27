@@ -219,6 +219,47 @@ int main(void)
     require_condition(indicator_only(&ctx),
                       "the ring must return to the indicator base after an event");
 
+    /* ---- 1b. A pulse with repeats ends after that many breaths, back to
+       the base or to the pattern it interrupted; repeats 0 runs until
+       stopped.  (A weather heads-up's 4-breath pulse ran on for an hour.) */
+    reset(&ctx);
+    fire(&ctx, "{\"v\":1,\"id\":1,\"cmd\":\"pattern\",\"args\":"
+               "{\"name\":\"pulse\",\"r\":0,\"g\":150,\"b\":255,"
+               "\"brightness\":70,\"repeats\":2,\"owner\":\"wx\"}}");
+    require_condition(response_ok() && ctx.pattern_active,
+                      "a pulse must take the ring");
+    t0 = ctx.pattern_started;
+    update_pattern(&ctx, t0 + 2.0 * PULSE_PERIOD_S - 0.1);
+    require_condition(ctx.pattern_active,
+                      "a 2-repeat pulse must still run in its second breath");
+    update_pattern(&ctx, t0 + 2.0 * PULSE_PERIOD_S + 0.1);
+    require_condition(!ctx.pattern_active,
+                      "a 2-repeat pulse must end after two breaths");
+    require_condition(indicator_only(&ctx),
+                      "a finished pulse must return the ring to the indicator");
+
+    reset(&ctx);
+    fire(&ctx, "{\"v\":1,\"id\":1,\"cmd\":\"pattern\",\"args\":"
+               "{\"name\":\"pulse\",\"r\":0,\"g\":150,\"b\":255,"
+               "\"brightness\":70,\"repeats\":0,\"owner\":\"wx\"}}");
+    t0 = ctx.pattern_started;
+    update_pattern(&ctx, t0 + 1000.0);
+    require_condition(ctx.pattern_active,
+                      "a pulse with repeats 0 must run until stopped");
+
+    reset(&ctx);
+    fire(&ctx, "{\"v\":1,\"id\":1,\"cmd\":\"pattern\",\"args\":"
+               "{\"name\":\"solid\",\"r\":255,\"g\":0,\"b\":0,"
+               "\"brightness\":100,\"repeats\":0,\"owner\":\"base\"}}");
+    fire(&ctx, "{\"v\":1,\"id\":1,\"cmd\":\"pattern\",\"args\":"
+               "{\"name\":\"pulse\",\"r\":0,\"g\":150,\"b\":255,"
+               "\"brightness\":70,\"repeats\":1,\"owner\":\"wx\"}}");
+    t0 = ctx.pattern_started;
+    update_pattern(&ctx, t0 + PULSE_PERIOD_S + 0.1);
+    require_condition(ctx.pattern_active && !strcmp(ctx.pattern_owner, "base") &&
+                      ctx.pattern_kind == PATTERN_SOLID,
+                      "a finished pulse must hand back the pattern it interrupted");
+
     reset(&ctx);
     ctx.state.idle_mode = IDLE_MODE_OFF;
     apply_base_state(&ctx, 0.0);
