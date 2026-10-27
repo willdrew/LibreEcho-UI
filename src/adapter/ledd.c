@@ -2788,6 +2788,8 @@ static double pixel_lateral(size_t i)
    Scanner: a bar sweeps left to right and back once per period; each pixel
    takes the brightest of the last few head positions, fading with age, so
    the bar leaves a trail like KITT's. */
+/* One breath of the pulse pattern; its repeats count breaths. */
+#define PULSE_PERIOD_S 1.5
 #define CHASE_TAIL_PIXELS 5.0
 #define SCANNER_WIDTH 0.45
 #define SCANNER_TRAIL_STEPS 8
@@ -2846,8 +2848,13 @@ static void update_pattern(struct daemon_context *ctx, double now)
     int on = 1;
 
     if (ctx->pattern_kind == PATTERN_PULSE) {
-        double phase = elapsed * 0.6666666667;
+        double phase = elapsed / PULSE_PERIOD_S;
         double wave;
+        if (ctx->pattern_repeats &&
+            elapsed >= PULSE_PERIOD_S * (double)ctx->pattern_repeats) {
+            finish_pattern(ctx, now);
+            return;
+        }
         while (phase >= 1.0) phase -= 1.0;
         wave = 0.20 + 0.80 * (0.5 + 0.5 * sine_approx(phase * 6.28318530717958647692));
         hardware_apply_level(ctx, &output,
