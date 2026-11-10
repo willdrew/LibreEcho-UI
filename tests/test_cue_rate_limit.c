@@ -335,6 +335,28 @@ int main(void)
     drain_bus(QUIET_MS);
     CHECK(bus_bytes - (size_t)before == CHIRP_BYTES(40));
 
+    /*
+     * 8. A lead (LE_AUDIO_CUE_LEAD_MS, the Spot): its amplifier comes up
+     *    ~300 ms after an idle output opens, so a cue from idle starts with
+     *    that much silence and ends with a short silent tail; heard
+     *    otherwise as only the amplifier's pop.  Card 99 has no amplifier
+     *    to report, so it reads as off.
+     */
+    audio.card = 99;
+    audio.cue_lead_ms = 400;
+    settle();
+    before = (int)bus_bytes;
+    CHECK(send_request(&audio, "wake_chirp", NULL, response,
+                       sizeof(response)) == 1);
+    drain_bus(QUIET_MS + 400);
+    if (bus_bytes - (size_t)before !=
+        CHIRP_BYTES(400) + CHIRP_BYTES(LE_CHIRP_MS) + CHIRP_BYTES(LE_CUE_TAIL_MS))
+        fprintf(stderr, "cue rate limit: lead cue bytes=%zu\n",
+                bus_bytes - (size_t)before);
+    CHECK(bus_bytes - (size_t)before ==
+          CHIRP_BYTES(400) + CHIRP_BYTES(LE_CHIRP_MS) + CHIRP_BYTES(LE_CUE_TAIL_MS));
+    audio.cue_lead_ms = 0;
+
     puts("cue rate limit: burst coalescing, bounded writers, and "
          "interval recovery: ok");
     close(fifo_fd);
