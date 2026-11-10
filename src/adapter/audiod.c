@@ -183,6 +183,15 @@ struct snd_ctl_elem_value {
  * no longer become a machine-gun run of writers.
  */
 #define LE_CUE_MIN_INTERVAL_MS 200
+
+/*
+ * Cue lead (LE_AUDIO_CUE_LEAD_MS, 0 by default; the Spot sets it).  The
+ * Spot's amplifier unmutes ~300 ms after an idle output opens and mutes soon
+ * after it ends, so a 90 ms cue from idle was heard only as the amplifier's
+ * pop.  With the amplifier off a cue starts with this much silence and ends
+ * with LE_CUE_TAIL_MS more, so the tone plays while it is on.
+ */
+#define LE_CUE_TAIL_MS 100
 /* start_cue's third outcome: the gate refused, nothing was forked. */
 #define LE_CUE_THROTTLED 1
 
@@ -282,6 +291,7 @@ struct audio_hw {
     time_t noise_started;
     int startup_sound;
     int amplifier_on;
+    unsigned int cue_lead_ms;   /* LE_AUDIO_CUE_LEAD_MS: see LE_CUE_TAIL_MS */
     char system_audio_bus[PATH_MAX];
     int volume_leveling;     /* music AVL in the audio engine, persisted */
     long long last_leveling_check_ms;
@@ -1581,15 +1591,57 @@ static int write_tone_fd(int fd)
     return 0;
 }
 
+/* frames of silence onto the bus, with the same EAGAIN/poll contract. */
+static int write_silence_fd(int fd, size_t frames)
+{
+    unsigned char buffer[LE_TONE_CHUNK_FRAMES * LE_TONE_CHANNELS *
+                         sizeof(int16_t)];
+
+    memset(buffer, 0, sizeof(buffer));
+    while (frames > 0) {
+        size_t chunk = frames < LE_TONE_CHUNK_FRAMES
+                     ? frames : LE_TONE_CHUNK_FRAMES;
+        size_t bytes = chunk * LE_TONE_CHANNELS * sizeof(int16_t);
+        size_t sent = 0;
+
+        while (sent < bytes) {
+            ssize_t n = write(fd, buffer + sent, bytes - sent);
+
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                struct pollfd pfd = { fd, POLLOUT, 0 };
+                int rc;
+
+                do {
+                    rc = poll(&pfd, 1, 200);
+                } while (rc < 0 && errno == EINTR);
+                if (rc > 0)
+                    continue;
+            }
+            if (n <= 0)
+                return -1;
+            sent += (size_t)n;
+        }
+        frames -= chunk;
+    }
+    return 0;
+}
+
 static int write_chirp_fd(int fd, double first_hz, double second_hz,
-                          unsigned int ms)
+                          unsigned int ms, unsigned int lead_ms,
+                          unsigned int tail_ms)
 {
     unsigned char buffer[LE_TONE_CHUNK_FRAMES * LE_TONE_CHANNELS *
                          sizeof(int16_t)];
     size_t total = (size_t)LE_PCM_RATE * ms / 1000U;
+    size_t lead = (size_t)LE_PCM_RATE * lead_ms / 1000U;
+    size_t tail = (size_t)LE_PCM_RATE * tail_ms / 1000U;
     size_t done = 0;
     double phase = 0.0;
 
+    if (write_silence_fd(fd, lead) < 0)
+        return -1;
     while (done < total) {
         size_t frames = total - done < LE_TONE_CHUNK_FRAMES
                       ? total - done : LE_TONE_CHUNK_FRAMES;
@@ -1642,7 +1694,7 @@ static int write_chirp_fd(int fd, double first_hz, double second_hz,
         }
         done += frames;
     }
-    return 0;
+    return write_silence_fd(fd, tail);
 }
 
 /*
@@ -2028,7 +2080,10 @@ static int start_cue(struct audio_hw *audio, double first_hz,
         return -1;
     }
     if (pid == 0) {
-        int result = write_chirp_fd(fd, first_hz, second_hz, ms);
+        unsigned int lead = audio->cue_lead_ms && !amplifier_active(audio)
+                          ? audio->cue_lead_ms : 0;
+        int result = write_chirp_fd(fd, first_hz, second_hz, ms, lead,
+                                    lead ? LE_CUE_TAIL_MS : 0);
         close(fd);
         _exit(result == 0 ? 0 : 1);
     }
@@ -2979,6 +3034,12 @@ int main(int argc, char **argv)
         if (audio_set_volume(&audio, audio.volume) < 0)
             audio.output_available = 0;
         else refresh_state(&audio);
+    }
+    {
+        const char *lead = getenv("LE_AUDIO_CUE_LEAD_MS");
+        unsigned long ms = lead && *lead ? strtoul(lead, NULL, 10) : 0;
+
+        audio.cue_lead_ms = ms > 1000 ? 1000 : (unsigned int)ms;
     }
     if (snprintf(audio.system_audio_bus, sizeof(audio.system_audio_bus),
                  "%s", system_bus) >= (int)sizeof(audio.system_audio_bus)) {
